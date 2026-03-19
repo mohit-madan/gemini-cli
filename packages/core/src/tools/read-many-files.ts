@@ -37,6 +37,7 @@ import { logFileOperation } from '../telemetry/loggers.js';
 import { FileOperationEvent } from '../telemetry/types.js';
 import { ToolErrorType } from './tool-error.js';
 import { READ_MANY_FILES_TOOL_NAME } from './tool-names.js';
+import { FileDiscoveryService } from '../services/fileDiscoveryService.js';
 import { READ_MANY_FILES_DEFINITION } from './definitions/coreTools.js';
 import { resolveToolDeclaration } from './definitions/resolver.js';
 
@@ -186,6 +187,20 @@ ${finalExclusionPatternsForDescription
     try {
       const allEntries = new Set<string>();
       const workspaceDirs = this.config.getWorkspaceContext().getDirectories();
+      const targetDir = this.config.getTargetDir();
+
+      const filterOptions = {
+        respectGitIgnore:
+          this.params.file_filtering_options?.respect_git_ignore ??
+          this.config.getFileFilteringOptions().respectGitIgnore ??
+          DEFAULT_FILE_FILTERING_OPTIONS.respectGitIgnore,
+        respectGeminiIgnore:
+          this.params.file_filtering_options?.respect_gemini_ignore ??
+          this.config.getFileFilteringOptions().respectGeminiIgnore ??
+          DEFAULT_FILE_FILTERING_OPTIONS.respectGeminiIgnore,
+      };
+
+      let totalIgnoredCount = 0;
 
       for (const dir of workspaceDirs) {
         const processedPatterns = [];
@@ -217,33 +232,35 @@ ${finalExclusionPatternsForDescription
           nocase: true,
           signal,
         });
-        for (const entry of entriesInDir) {
-          allEntries.add(entry);
+
+        // Filter per-directory so that .gitignore/.geminiignore files inside
+        // includeDirectories (which may be outside targetDir) are respected.
+        // Using a service rooted at targetDir would cause GitIgnoreParser to
+        // skip files whose resolved path falls outside the project root.
+        const serviceForDir =
+          dir === targetDir
+            ? this.config.getFileService()
+            : new FileDiscoveryService(dir, filterOptions);
+
+        const relativeEntriesInDir = entriesInDir.map((p) =>
+          path.relative(dir, p),
+        );
+
+        const { filteredPaths: filteredInDir, ignoredCount: ignoredInDir } =
+          serviceForDir.filterFilesWithReport(
+            relativeEntriesInDir,
+            filterOptions,
+          );
+
+        totalIgnoredCount += ignoredInDir;
+
+        for (const relPath of filteredInDir) {
+          allEntries.add(path.join(dir, relPath));
         }
       }
-      const relativeEntries = Array.from(allEntries).map((p) =>
-        path.relative(this.config.getTargetDir(), p),
-      );
 
-      const fileDiscovery = this.config.getFileService();
-
-      const { filteredPaths, ignoredCount } =
-        fileDiscovery.filterFilesWithReport(relativeEntries, {
-          respectGitIgnore:
-            this.params.file_filtering_options?.respect_git_ignore ??
-            this.config.getFileFilteringOptions().respectGitIgnore ??
-            DEFAULT_FILE_FILTERING_OPTIONS.respectGitIgnore,
-          respectGeminiIgnore:
-            this.params.file_filtering_options?.respect_gemini_ignore ??
-            this.config.getFileFilteringOptions().respectGeminiIgnore ??
-            DEFAULT_FILE_FILTERING_OPTIONS.respectGeminiIgnore,
-        });
-
-      for (const relativePath of filteredPaths) {
+      for (const fullPath of allEntries) {
         // Security check: ensure the glob library didn't return something outside the workspace.
-
-        const fullPath = path.resolve(this.config.getTargetDir(), relativePath);
-
         const validationError = this.config.validatePathAccess(
           fullPath,
           'read',
@@ -259,9 +276,9 @@ ${finalExclusionPatternsForDescription
       }
 
       // Add info about ignored files if any were filtered
-      if (ignoredCount > 0) {
+      if (totalIgnoredCount > 0) {
         skippedFiles.push({
-          path: `${ignoredCount} file(s)`,
+          path: `${totalIgnoredCount} file(s)`,
           reason: 'ignored by project ignore files',
         });
       }

@@ -602,6 +602,77 @@ describe('ReadManyFilesTool', () => {
       fs.rmSync(tempDir2, { recursive: true, force: true });
     });
 
+    it('should respect .gitignore in an includeDirectory outside targetDir', async () => {
+      const tempDir1 = fs.realpathSync(
+        fs.mkdtempSync(path.join(os.tmpdir(), 'multi-dir-gitignore-1-')),
+      );
+      const tempDir2 = fs.realpathSync(
+        fs.mkdtempSync(path.join(os.tmpdir(), 'multi-dir-gitignore-2-')),
+      );
+
+      try {
+        // tempDir2 is an includeDirectory that is itself a git repo with its own .gitignore
+        fs.mkdirSync(path.join(tempDir2, '.git'));
+        fs.writeFileSync(path.join(tempDir2, '.gitignore'), 'cache/\n');
+        fs.mkdirSync(path.join(tempDir2, 'cache'));
+        fs.writeFileSync(path.join(tempDir2, 'cache', 'ignored.ts'), 'cached');
+        fs.writeFileSync(path.join(tempDir2, 'allowed.ts'), 'allowed');
+
+        const fileService = new FileDiscoveryService(tempDir1);
+        const mockConfig = {
+          getFileService: () => fileService,
+          getFileSystemService: () => new StandardFileSystemService(),
+          getFileFilteringOptions: () => ({
+            respectGitIgnore: true,
+            respectGeminiIgnore: true,
+            customIgnoreFilePaths: [],
+          }),
+          getWorkspaceContext: () => new WorkspaceContext(tempDir1, [tempDir2]),
+          getTargetDir: () => tempDir1,
+          getFileExclusions: () => ({
+            getCoreIgnorePatterns: () => COMMON_IGNORE_PATTERNS,
+            getDefaultExcludePatterns: () => [],
+            getGlobExcludes: () => COMMON_IGNORE_PATTERNS,
+            buildExcludePatterns: () => [],
+            getReadManyFilesExcludes: () => [],
+          }),
+          isInteractive: () => false,
+          storage: {
+            getProjectTempDir: vi.fn().mockReturnValue('/tmp/project'),
+          },
+          isPathAllowed(this: Config, absolutePath: string): boolean {
+            return this.getWorkspaceContext().isPathWithinWorkspace(
+              absolutePath,
+            );
+          },
+          validatePathAccess(
+            this: Config,
+            absolutePath: string,
+          ): string | null {
+            return this.isPathAllowed(absolutePath)
+              ? null
+              : 'Path not in workspace';
+          },
+        } as unknown as Config;
+
+        const localTool = new ReadManyFilesTool(
+          mockConfig,
+          createMockMessageBus(),
+        );
+        const params = { include: ['**/*.ts'] };
+        const invocation = localTool.build(params);
+        const result = await invocation.execute(new AbortController().signal);
+        const display = result.returnDisplay as string;
+
+        expect(display).toContain('allowed.ts');
+        expect(display).not.toContain('ignored.ts');
+        expect(display).toContain('ignored by project ignore files');
+      } finally {
+        fs.rmSync(tempDir1, { recursive: true, force: true });
+        fs.rmSync(tempDir2, { recursive: true, force: true });
+      }
+    });
+
     it('should add a warning for truncated files', async () => {
       createFile('file1.txt', 'Content1');
       // Create a file that will be "truncated" by making it long
